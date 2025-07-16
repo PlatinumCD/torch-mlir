@@ -16,6 +16,11 @@ include "mlir/Pass/PassBase.td"
 // Torch conversions
 //===----------------------------------------------------------------------===//
 
+def ConvertTorchToAnalog : Pass<"convert-torch-to-analog", "func::FuncOp"> {
+  let summary = "Covert recognized Torch ops to custom analog calls";
+  let constructor = "mlir::torch::createConvertTorchToAnalogPass()";
+}
+
 def ConvertTorchToArith : Pass<"convert-torch-to-arith", "func::FuncOp"> {
   let summary = "Convert recognized Torch ops to Std ops";
   let constructor = "mlir::torch::createConvertTorchToArithPass()";
