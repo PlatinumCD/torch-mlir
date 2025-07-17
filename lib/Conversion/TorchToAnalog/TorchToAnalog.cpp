@@ -15,7 +15,14 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+
+
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -38,7 +45,7 @@ using namespace mlir::torch::Torch;
 
 //  ───  Conversion pattern  ────────────────────────────────────────────
 struct MmToCall : OpConversionPattern<AtenMmOp> {
-  using OpConversionPattern::OpConversionPattern;   // gives us TypeConverter
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult matchAndRewrite(
       AtenMmOp mm, OpAdaptor adaptor,
@@ -46,73 +53,126 @@ struct MmToCall : OpConversionPattern<AtenMmOp> {
 
     Location loc = mm.getLoc();
 
-    // Converted operands (RankedTensorType) are already provided by `adaptor`.
-    Value lhs = adaptor.getSelf();        // tensor<3x4xf32>
-    Value rhs = adaptor.getMat2();        // tensor<4x4xf32>
+    //--- 1. Grab operands -------------------------------------
+    Value lhs = adaptor.getSelf();   // tensor<MxKxf32>
+    Value rhs = adaptor.getMat2();   // tensor<KxNxf32>
 
-    // ------------------------------------------------------------------
-    // 1. Result tensor prototype (converted from !torch.vtensor)
-    // ------------------------------------------------------------------
+    //--- 2. Result tensor type --------------------------------
     Type newResTy = getTypeConverter()->convertType(mm.getType());
     auto rankedTy = newResTy.cast<RankedTensorType>();
     Type elemTy   = rankedTy.getElementType();
 
-    // Create `tensor.empty` with same (static) shape 3×4.
-    Value init = rewriter.create<tensor::EmptyOp>(
-        loc, rankedTy.getShape(), elemTy);
+    //--- 3. Ranked memrefs (keep them ranked!) ---------------
+    auto lhsRTy = lhs.getType().cast<RankedTensorType>();
+    auto rhsRTy = rhs.getType().cast<RankedTensorType>();
+    auto outRTy = rankedTy;
+    auto lhsMR  = MemRefType::get(lhsRTy.getShape(), elemTy);
+    auto rhsMR  = MemRefType::get(rhsRTy.getShape(), elemTy);
+    auto outMR  = MemRefType::get(outRTy.getShape(), elemTy);
 
-    // Optional zero-fill so CUSTOM_OP sees a clean buffer.
-    Value zero = rewriter.create<arith::ConstantOp>(
-        loc, FloatAttr::get(elemTy, 0.0));
-    Value out  =
-        rewriter.create<linalg::FillOp>(loc, zero, init).getResult(0);
+    Value lhsBuf = rewriter.create<bufferization::ToMemrefOp>(loc, lhsMR, lhs);
+    Value rhsBuf = rewriter.create<bufferization::ToMemrefOp>(loc, rhsMR, rhs);
+    Value outBuf = rewriter.create<memref::AllocOp>(loc, outMR);   // scratch dest
 
-    // ------------------------------------------------------------------
-    // 2. Ensure symbol @CUSTOM_OP exists with *converted* memref types
-    // ------------------------------------------------------------------
-    auto tensorToMemRef = [&](Value v) {
-      auto t = v.getType().cast<RankedTensorType>();
-      return MemRefType::get(t.getShape(), elemTy);         // identity layout
-    };
-    MemRefType outBufTy = tensorToMemRef(out);   // M × N
-    MemRefType lhsBufTy = tensorToMemRef(lhs);   // M × K
-    MemRefType rhsBufTy = tensorToMemRef(rhs);
+    //--- 4. Zero dest because custom_mm does "+=" -----------------------
+    Value zeroVal = rewriter.create<arith::ConstantOp>(loc, FloatAttr::get(elemTy, 0.0));
+    // linalg.fill(memref form) - in older MLIR use tensor Empty+Fill+Copy; 
+    rewriter.create<linalg::FillOp>(loc, ValueRange{zeroVal}, ValueRange{outBuf});
 
+    //--- 5. Dynamic dims + row-major leading dims ------------------------------
+    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value M = rewriter.create<memref::DimOp>(loc, lhsBuf, c0);
+    Value K = rewriter.create<memref::DimOp>(loc, lhsBuf, c1);
+    Value N = rewriter.create<memref::DimOp>(loc, rhsBuf, c1);
+    Value lda = K, ldb = N, ldc = N;
+
+    //--- 6. Ensure raw-pointer func decl exists --------------------------------
     ModuleOp mod = mm->getParentOfType<ModuleOp>();
-    FunctionType fnTy =
-        rewriter.getFunctionType({outBufTy, lhsBufTy, rhsBufTy}, {});
+    auto i32Ty        = rewriter.getI32Type();
+    auto llvmPtrF32Ty = LLVM::LLVMPointerType::get(elemTy);
 
-    if (auto old = mod.lookupSymbol<func::FuncOp>("CUSTOM_OP"))
-      if (old.getFunctionType() != fnTy) old.erase();
+    auto fnTy = rewriter.getFunctionType(
+      {llvmPtrF32Ty, llvmPtrF32Ty, llvmPtrF32Ty,
+       i32Ty,i32Ty,i32Ty,i32Ty,i32Ty,i32Ty},
+      {});
 
-    if (!mod.lookupSymbol<func::FuncOp>("CUSTOM_OP")) {
-      PatternRewriter::InsertionGuard g(rewriter);
-      rewriter.setInsertionPointToStart(mod.getBody());
-      rewriter.create<func::FuncOp>(loc, "CUSTOM_OP", fnTy).setPrivate();
+    if (auto old = mod.lookupSymbol<func::FuncOp>("analog_mm")) {
+      if (old.getFunctionType() != fnTy) {
+        old.erase();
+      }
     }
 
-    // ------------------------------------------------------------------
-    // 3. Cast tensors → memref, call, replace
-    // ------------------------------------------------------------------
-    auto toMemref = [&](Value t, MemRefType ty) {
-      return rewriter.create<bufferization::ToMemrefOp>(loc, ty, t);
+    if (!mod.lookupSymbol<func::FuncOp>("analog_mm")) {
+      PatternRewriter::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      rewriter.create<func::FuncOp>(loc, "analog_mm", fnTy).setPrivate();
+    }
+
+    //--- 7. Ranked → raw pointer (aligned, include offset) ---------------------
+    auto i64Ty = rewriter.getI64Type();
+
+    // aligned base ptrs (as index)
+    Value lhsBaseIdx = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, lhsBuf);
+    Value rhsBaseIdx = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, rhsBuf);
+    Value outBaseIdx = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, outBuf);
+
+    // element offset in *elements*:
+    // extract_strided_metadata returns (base, offset, sizes..., strides...)
+    auto metaL = rewriter.create<memref::ExtractStridedMetadataOp>(loc, lhsBuf);
+    auto metaR = rewriter.create<memref::ExtractStridedMetadataOp>(loc, rhsBuf);
+    auto metaO = rewriter.create<memref::ExtractStridedMetadataOp>(loc, outBuf);
+    Value lhsOffElems = metaL.getOffset();
+    Value rhsOffElems = metaR.getOffset();
+    Value outOffElems = metaO.getOffset();
+
+    // convert base index -> i64
+    Value lhsBaseI64 = rewriter.create<arith::IndexCastOp>(loc, i64Ty, lhsBaseIdx);
+    Value rhsBaseI64 = rewriter.create<arith::IndexCastOp>(loc, i64Ty, rhsBaseIdx);
+    Value outBaseI64 = rewriter.create<arith::IndexCastOp>(loc, i64Ty, outBaseIdx);
+
+    // scale offsets by sizeof(elem) (4 for f32) if non-zero
+    Value elemBytes = rewriter.create<arith::ConstantIntOp>(loc, /*value=*/4, /*width=*/64);
+    auto mulBytes = [&](Value offElems) -> Value {
+      return rewriter.create<arith::MulIOp>(loc, rewriter.create<arith::IndexCastOp>(loc, i64Ty, offElems), elemBytes);
     };
-    Value outBuf = toMemref(out, outBufTy);
-    Value lhsBuf = toMemref(lhs, lhsBufTy);
-    Value rhsBuf = toMemref(rhs, rhsBufTy);
 
-    rewriter.create<func::CallOp>(loc, "CUSTOM_OP", TypeRange{},
-                                  ValueRange{outBuf, lhsBuf, rhsBuf});
-//                                  ValueRange{lhsBuf, rhsBuf, outBuf});
+    Value lhsOffB = mulBytes(lhsOffElems);
+    Value rhsOffB = mulBytes(rhsOffElems);
+    Value outOffB = mulBytes(outOffElems);
 
-    // Cast the (now-filled) buffer back to the precise tensor result type.
-    Value resultTensor =
-        rewriter.create<bufferization::ToTensorOp>(loc, outBuf);
+    // add base+offset
+    Value lhsPtrI64 = rewriter.create<arith::AddIOp>(loc, lhsBaseI64, lhsOffB);
+    Value rhsPtrI64 = rewriter.create<arith::AddIOp>(loc, rhsBaseI64, rhsOffB);
+    Value outPtrI64 = rewriter.create<arith::AddIOp>(loc, outBaseI64, outOffB);
+
+    // inttoptr to !llvm.ptr<f32>
+    Value lhsPtr = rewriter.create<LLVM::IntToPtrOp>(loc, llvmPtrF32Ty, lhsPtrI64);
+    Value rhsPtr = rewriter.create<LLVM::IntToPtrOp>(loc, llvmPtrF32Ty, rhsPtrI64);
+    Value outPtr = rewriter.create<LLVM::IntToPtrOp>(loc, llvmPtrF32Ty, outPtrI64);
+
+    //--- 8. Cast dims/ld* to i32 ------------------------------------------------
+    auto cast32 = [&](Value v) {
+      return rewriter.create<arith::IndexCastOp>(loc, i32Ty, v);
+    };
+
+    Value Mi   = cast32(M);
+    Value Ki   = cast32(K);
+    Value Ni   = cast32(N);
+    Value ldai = cast32(lda);
+    Value ldbi = cast32(ldb);
+    Value ldci = cast32(ldc);
+
+    //--- 9. Call raw-pointer analog_mm -----------------------------------------
+    rewriter.create<func::CallOp>(
+      loc, "analog_mm", TypeRange{},
+      ValueRange{lhsPtr, rhsPtr, outPtr,
+                 Mi, Ki, Ni, ldai, ldbi, ldci});
+
+    //--- 10. Return tensor aliasing outBuf -------------------------------------
+    Value resultTensor = rewriter.create<bufferization::ToTensorOp>(loc, outBuf);
     resultTensor.getDefiningOp()->setAttr("restrict", rewriter.getUnitAttr());
-
-    resultTensor =
-        rewriter.create<tensor::CastOp>(loc, newResTy, resultTensor);
-
+    resultTensor = rewriter.create<tensor::CastOp>(loc, newResTy, resultTensor);
     rewriter.replaceOp(mm, resultTensor);
     return success();
   }
@@ -120,45 +180,45 @@ struct MmToCall : OpConversionPattern<AtenMmOp> {
 
 namespace {
 class ConvertTorchToAnalog
-    : public ConvertTorchToAnalogBase<ConvertTorchToAnalog> {
+: public ConvertTorchToAnalogBase<ConvertTorchToAnalog> {
 public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<func::FuncDialect>();
-    registry.insert<Torch::TorchDialect>();
-    registry.insert<linalg::LinalgDialect>();
-    registry.insert<arith::ArithDialect>();
-    registry.insert<tensor::TensorDialect>();
-    registry.insert<bufferization::BufferizationDialect>();
-    TorchConversion::getBackendTypeConversionDependentDialects(registry);
-  }
+void getDependentDialects(DialectRegistry &registry) const override {
+registry.insert<func::FuncDialect>();
+registry.insert<Torch::TorchDialect>();
+registry.insert<linalg::LinalgDialect>();
+registry.insert<arith::ArithDialect>();
+registry.insert<tensor::TensorDialect>();
+registry.insert<bufferization::BufferizationDialect>();
+TorchConversion::getBackendTypeConversionDependentDialects(registry);
+}
 
-  void runOnOperation() override {
-    MLIRContext *context = &getContext();
-    ConversionTarget target(*context);
-    target.addLegalDialect<
-        func::FuncDialect, 
-        Torch::TorchDialect,
-        linalg::LinalgDialect,
-        arith::ArithDialect,
-        bufferization::BufferizationDialect>();
+void runOnOperation() override {
+MLIRContext *context = &getContext();
+ConversionTarget target(*context);
+target.addLegalDialect<
+    func::FuncDialect, 
+    Torch::TorchDialect,
+    linalg::LinalgDialect,
+    arith::ArithDialect,
+    bufferization::BufferizationDialect>();
 
-    target.addIllegalOp<AtenMmOp>();
-    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+target.addIllegalOp<AtenMmOp>();
+target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
 
-    TypeConverter typeConverter;
-    typeConverter.addConversion([](Type type) { return type; });
-    TorchConversion::setupBackendTypeConversion(target, typeConverter);
+TypeConverter typeConverter;
+typeConverter.addConversion([](Type type) { return type; });
+TorchConversion::setupBackendTypeConversion(target, typeConverter);
 
-    RewritePatternSet patterns(context);
-    patterns.add<MmToCall>(typeConverter, context);
+RewritePatternSet patterns(context);
+patterns.add<MmToCall>(typeConverter, context);
 
-    // Add Patterns
+// Add Patterns
 
-    if (failed(applyPartialConversion(getOperation(), target,
-                                      std::move(patterns))))
-      return signalPassFailure();
-  }
+if (failed(applyPartialConversion(getOperation(), target,
+                                  std::move(patterns))))
+  return signalPassFailure();
+}
 };
 } // namespace
 
