@@ -394,6 +394,11 @@ MlirValue IValueImporter::importTensor(c10::IValue ivalue) {
         toMlirNamedAttribute("value", denseElements));
   }
 
+  mlirOperationSetAttributeByName(
+    tensorOp,
+    toMlirStringRef("torch.marked_as_weight"),
+    mlirUnitAttrGet(context));
+
   MlirValue tensorReprValue = mlirOperationGetResult(tensorOp, 0);
 
   // Construct the complete tensor value. This is trivial for most tensors, but

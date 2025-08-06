@@ -259,6 +259,8 @@ reduceNonValueTensorLiteralOpToValueTensorLiteralOp(NonValueTensorLiteralOp op,
                                                     PatternRewriter &rewriter) {
   Value valueTensor =
       rewriter.create<ValueTensorLiteralOp>(op->getLoc(), op.getValue());
+  if (auto *vop = valueTensor.getDefiningOp())
+    vop->setAttrs(op->getAttrs());
   Value tensor =
       copyTensorToType(rewriter, op->getLoc(), op.getType(), valueTensor);
   rewriter.replaceOp(op, {tensor});
